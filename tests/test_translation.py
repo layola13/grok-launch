@@ -3,6 +3,7 @@ import os
 import sys
 import unittest
 import io
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -169,7 +170,7 @@ class TranslationTests(unittest.TestCase):
             b'data: {"choices":[{"delta":{"content":"Hello"}}]}\n',
             b'data: {"choices":[{"delta":{"content":" world"}}]}\n',
             b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_999","function":{"name":"exec_command","arguments":"{\\"cmd\\":"}}]}}]}\n',
-            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"ls\\"}}"}}]}}]}\n',
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"ls\\""}}]}}]}\n',
             b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]}}]}\n',
             b"data: [DONE]\n"
         ]
@@ -197,7 +198,28 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(events[2]["event"], "response.output_text.delta")
         self.assertEqual(events[3]["event"], "response.output_text.delta")
         
-        tool_done_event = [e for e in events if e["event"] == "response.output_item.done" and e["data"].get("item", {}).get("type") == "function_call"]
+        tool_added_event = [
+            e for e in events
+            if e["event"] == "response.output_item.added"
+            and e["data"].get("item", {}).get("type") == "function_call"
+        ]
+        self.assertEqual(len(tool_added_event), 1)
+        self.assertEqual(tool_added_event[0]["data"]["item"]["call_id"], "call_999")
+        self.assertEqual(tool_added_event[0]["data"]["item"]["name"], "exec_command")
+
+        args_delta_event = [e for e in events if e["event"] == "response.function_call_arguments.delta"]
+        self.assertEqual(len(args_delta_event), 1)
+        self.assertEqual(args_delta_event[0]["data"]["delta"], "{\"cmd\":\"ls\"}")
+
+        args_done_event = [e for e in events if e["event"] == "response.function_call_arguments.done"]
+        self.assertEqual(len(args_done_event), 1)
+        self.assertEqual(args_done_event[0]["data"]["arguments"], "{\"cmd\":\"ls\"}")
+
+        tool_done_event = [
+            e for e in events
+            if e["event"] == "response.output_item.done"
+            and e["data"].get("item", {}).get("type") == "function_call"
+        ]
         self.assertEqual(len(tool_done_event), 1)
         self.assertEqual(tool_done_event[0]["data"]["item"]["call_id"], "call_999")
         self.assertEqual(tool_done_event[0]["data"]["item"]["name"], "exec_command")
@@ -229,6 +251,92 @@ class TranslationTests(unittest.TestCase):
         # Clean up
         main.API_KEYS = ["mock-key"]
         main.FROZEN_KEYS = {}
+
+    def test_sanitize_chat_stream_chunk_removes_empty_tool_name(self) -> None:
+        chunk = (
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+            b'"function":{"name":"","arguments":"{}"}}]}}]}\n'
+        )
+        sanitized = main.sanitize_chat_stream_chunk(chunk)
+        parsed = json.loads(sanitized.decode("utf-8")[5:].strip())
+        fn = parsed["choices"][0]["delta"]["tool_calls"][0]["function"]
+        self.assertNotIn("name", fn)
+        self.assertEqual(fn["arguments"], "{}")
+
+    def test_payload_with_upstream_model_rewrites_model(self) -> None:
+        main.TARGET_MODEL = "gpt-5.5"
+        body = main.payload_with_upstream_model({"model": "grok-4.5", "stream": True})
+        self.assertEqual(json.loads(body.decode("utf-8"))["model"], "gpt-5.5")
+
+    def test_main_does_not_inject_cli_model_by_default(self) -> None:
+        main.TARGET_MODEL = "upstream-model"
+        main.TARGET_API_KEY = "mock-key"
+        main.GROK_LAUNCH_CLI_MODEL = ""
+        main.GROK_BIN = "grok"
+        main.VERBOSE = False
+        main._LOADED_ENV_FILES = []
+
+        class FakeServer:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def serve_forever(self):
+                pass
+
+            def shutdown(self):
+                pass
+
+            def server_close(self):
+                pass
+
+        completed = type("Completed", (), {"returncode": 0})()
+
+        with patch.object(main, "load_config"), \
+            patch.object(main, "find_free_port", return_value=12345), \
+            patch.object(main, "ThreadingHTTPServer", FakeServer), \
+            patch.object(main.threading, "Thread", autospec=True), \
+            patch.object(main.subprocess, "run", return_value=completed) as run_mock, \
+            patch.object(sys, "argv", ["main.py", "-p", "hello"]), \
+            self.assertRaises(SystemExit) as cm:
+            main.main()
+
+        self.assertEqual(cm.exception.code, 0)
+        self.assertEqual(run_mock.call_args.args[0], ["grok", "-p", "hello"])
+
+    def test_main_injects_explicit_cli_model(self) -> None:
+        main.TARGET_MODEL = "upstream-model"
+        main.TARGET_API_KEY = "mock-key"
+        main.GROK_LAUNCH_CLI_MODEL = "gpt-4o"
+        main.GROK_BIN = "grok"
+        main.VERBOSE = False
+        main._LOADED_ENV_FILES = []
+
+        class FakeServer:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def serve_forever(self):
+                pass
+
+            def shutdown(self):
+                pass
+
+            def server_close(self):
+                pass
+
+        completed = type("Completed", (), {"returncode": 0})()
+
+        with patch.object(main, "load_config"), \
+            patch.object(main, "find_free_port", return_value=12345), \
+            patch.object(main, "ThreadingHTTPServer", FakeServer), \
+            patch.object(main.threading, "Thread", autospec=True), \
+            patch.object(main.subprocess, "run", return_value=completed) as run_mock, \
+            patch.object(sys, "argv", ["main.py", "--model", "custom-cli-model", "-p", "hello"]), \
+            self.assertRaises(SystemExit) as cm:
+            main.main()
+
+        self.assertEqual(cm.exception.code, 0)
+        self.assertEqual(run_mock.call_args.args[0], ["grok", "--model", "custom-cli-model", "-p", "hello"])
 
 
 if __name__ == "__main__":

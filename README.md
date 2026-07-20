@@ -85,11 +85,11 @@ grok-launch -p "hello"
 
 | Variable | Meaning |
 |----------|---------|
-| `GROK_LAUNCH_WIRE_API` | Upstream protocol mode: `"responses"` (direct forward, default) or `"chat"` (translate Responses to standard Chat Completions) |
+| `GROK_LAUNCH_WIRE_API` | Upstream protocol mode: `"chat"` translates Responses to Chat Completions and supports tools (default); use `"responses"` only for native Responses API upstreams. |
 | `GROK_LAUNCH_REASONING_EFFORT` | Default reasoning effort fallback (`"low"`, `"medium"`, `"high"` - only for reasoning models) |
 | `GROK_LAUNCH_MAX_COMPLETION_TOKENS` | Default maximum completion tokens (thinking limit fallback) |
 | `GROK_LAUNCH_MAX_TOKENS` | Default maximum context tokens limit fallback |
-| `GROK_LAUNCH_CLI_MODEL` | Default display model (default `gpt-4o`) |
+| `GROK_LAUNCH_CLI_MODEL` | Optional Grok CLI-side model override. Leave empty to let Grok choose its own default. |
 | `GROK_BIN` | Path to `grok` binary (default `grok`) |
 | `GROK_LAUNCH_PORT` | Fixed proxy port |
 | `GROK_LAUNCH_VERBOSE` | Enable proxy logging (`1` or `true`) |

@@ -36,12 +36,12 @@ TARGET_API_KEY: str = ""
 API_KEYS: list[str] = []
 FROZEN_KEYS: dict[str, float] = {}
 FROZEN_LOCK = threading.Lock()
-GROK_LAUNCH_CLI_MODEL: str = "gpt-4o"
+GROK_LAUNCH_CLI_MODEL: str = ""
 GROK_BIN: str = "grok"
 VERBOSE: bool = False
 DEBUG_DIR: str = ""
 _LOADED_ENV_FILES: list[str] = []
-WIRE_API: str = "responses"
+WIRE_API: str = "chat"
 REASONING_EFFORT: str = ""
 MAX_COMPLETION_TOKENS: int = 0
 MAX_TOKENS: int = 0
@@ -197,17 +197,17 @@ def load_config() -> None:
     TARGET_BASE_URL = os.environ["GROK_LAUNCH_BASE_URL"].strip().rstrip("/")
     TARGET_MODEL = os.environ["GROK_LAUNCH_MODEL"].strip()
     TARGET_API_KEY = API_KEYS[0]
-    GROK_LAUNCH_CLI_MODEL = (os.environ.get("GROK_LAUNCH_CLI_MODEL") or "gpt-4o").strip()
+    GROK_LAUNCH_CLI_MODEL = (os.environ.get("GROK_LAUNCH_CLI_MODEL") or "").strip()
     GROK_BIN = (os.environ.get("GROK_BIN") or "grok").strip()
     VERBOSE = (os.environ.get("GROK_LAUNCH_VERBOSE") or "").strip() in ("1", "true", "yes", "on")
     DEBUG_DIR = (
         os.environ.get("GROK_LAUNCH_DEBUG_DIR")
         or os.path.join(tempfile.gettempdir(), "grok-launch")
     ).strip()
-    WIRE_API = (os.environ.get("GROK_LAUNCH_WIRE_API") or "responses").strip().lower()
+    WIRE_API = (os.environ.get("GROK_LAUNCH_WIRE_API") or "chat").strip().lower()
     if WIRE_API not in ("responses", "chat"):
-        print(f"warning: unknown GROK_LAUNCH_WIRE_API value '{WIRE_API}'. defaulting to 'responses'.", file=sys.stderr)
-        WIRE_API = "responses"
+        print(f"warning: unknown GROK_LAUNCH_WIRE_API value '{WIRE_API}'. defaulting to 'chat'.", file=sys.stderr)
+        WIRE_API = "chat"
     REASONING_EFFORT = (os.environ.get("GROK_LAUNCH_REASONING_EFFORT") or "").strip().lower()
     try:
         MAX_COMPLETION_TOKENS = int(os.environ.get("GROK_LAUNCH_MAX_COMPLETION_TOKENS") or "0")
@@ -233,6 +233,62 @@ def build_upstream_url(path: str) -> str:
     if base.endswith("/v1") and rel.startswith("v1/"):
         rel = rel[3:]
     return f"{base}/{rel}{query}"
+
+
+def payload_with_upstream_model(payload: dict[str, Any]) -> bytes:
+    upstream_payload = dict(payload)
+    upstream_payload["model"] = TARGET_MODEL
+    return json.dumps(upstream_payload).encode("utf-8")
+
+
+def _debug_write(name: str, obj: Any) -> None:
+    if not DEBUG_DIR:
+        return
+    try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        path = os.path.join(DEBUG_DIR, name)
+        with open(path, "w", encoding="utf-8") as f:
+            if isinstance(obj, (bytes, bytearray)):
+                f.write(obj.decode("utf-8", errors="replace"))
+            elif isinstance(obj, str):
+                f.write(obj)
+            else:
+                json.dump(obj, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def sanitize_chat_stream_chunk(chunk_bytes: bytes) -> bytes:
+    line = chunk_bytes.decode("utf-8", errors="ignore")
+    stripped = line.strip()
+    if not stripped.startswith("data:"):
+        return chunk_bytes
+
+    data_val = stripped[5:].strip()
+    if not data_val or data_val == "[DONE]":
+        return chunk_bytes
+
+    try:
+        parsed = json.loads(data_val)
+    except Exception:
+        return chunk_bytes
+
+    changed = False
+    for choice in parsed.get("choices") or []:
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            continue
+        for tool_call in delta.get("tool_calls") or []:
+            if not isinstance(tool_call, dict):
+                continue
+            fn = tool_call.get("function")
+            if isinstance(fn, dict) and fn.get("name") == "":
+                del fn["name"]
+                changed = True
+
+    if not changed:
+        return chunk_bytes
+    return f"data: {json.dumps(parsed, ensure_ascii=False)}\n".encode("utf-8")
 
 
 def responses_request_to_chat(payload: dict[str, Any], active_model: str) -> dict[str, Any]:
@@ -563,15 +619,47 @@ def stream_chat_to_responses(upstream_response: Any) -> Generator[bytes, None, N
                     tc_entry["arguments"] += fn["arguments"]
 
     # Finalize tool calls
-    for index, tc_entry in sorted(tool_calls_map.items()):
+    for output_index, (index, tc_entry) in enumerate(sorted(tool_calls_map.items())):
         call_id = tc_entry["id"] or f"call_{uuid.uuid4().hex[:12]}"
         name = tc_entry["name"] or "tool"
         arguments = tc_entry["arguments"] or "{}"
+        item_id = tc_entry["item_id"]
+
+        item_added = {
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": {
+                "id": item_id,
+                "type": "function_call",
+                "call_id": call_id,
+                "name": name,
+                "arguments": ""
+            }
+        }
+        yield f"event: response.output_item.added\ndata: {json.dumps(item_added)}\n\n".encode("utf-8")
+
+        if arguments:
+            args_delta = {
+                "type": "response.function_call_arguments.delta",
+                "item_id": item_id,
+                "output_index": output_index,
+                "delta": arguments
+            }
+            yield f"event: response.function_call_arguments.delta\ndata: {json.dumps(args_delta)}\n\n".encode("utf-8")
+
+        args_done = {
+            "type": "response.function_call_arguments.done",
+            "item_id": item_id,
+            "output_index": output_index,
+            "arguments": arguments
+        }
+        yield f"event: response.function_call_arguments.done\ndata: {json.dumps(args_done)}\n\n".encode("utf-8")
 
         tc_done = {
             "type": "response.output_item.done",
+            "output_index": output_index,
             "item": {
-                "id": tc_entry["item_id"],
+                "id": item_id,
                 "type": "function_call",
                 "call_id": call_id,
                 "name": name,
@@ -719,17 +807,20 @@ class TranslationProxy(BaseHTTPRequestHandler):
 
         url = build_upstream_url(self.path)
         wants_stream = self.headers.get("Accept") == "text/event-stream" or payload.get("stream") == True
+        upstream_body = payload_with_upstream_model(payload)
+        _debug_write("chat_incoming_request.json", payload)
+        _debug_write("chat_outgoing_request.json", json.loads(upstream_body.decode("utf-8")))
 
         upstream_resp = None
         last_error = None
         for attempt in range(len(API_KEYS)):
             active_key = get_active_key()
             if VERBOSE:
-                print(f"[grok-launch] forwarding chat completions directly to: {url} stream={wants_stream} key={active_key[:10]}...", file=sys.stderr)
+                print(f"[grok-launch] forwarding chat completions directly to: {url} stream={wants_stream} model={TARGET_MODEL} key={active_key[:10]}...", file=sys.stderr)
 
             upstream_req = urllib.request.Request(
                 url,
-                data=body_bytes,
+                data=upstream_body,
                 headers={
                     "Content-Type": self.headers.get("Content-Type", "application/json"),
                     "Authorization": f"Bearer {active_key}",
@@ -778,11 +869,17 @@ class TranslationProxy(BaseHTTPRequestHandler):
             self.end_headers()
 
             try:
+                debug_chunks = []
                 for chunk_bytes in upstream_resp:
+                    chunk_bytes = sanitize_chat_stream_chunk(chunk_bytes)
                     if VERBOSE:
                         print(f"[grok-launch] forwarding chunk: {chunk_bytes}", file=sys.stderr)
+                    if DEBUG_DIR:
+                        debug_chunks.append(chunk_bytes.decode("utf-8", errors="replace"))
                     self.wfile.write(f"{len(chunk_bytes):X}\r\n".encode("utf-8") + chunk_bytes + b"\r\n")
                     self.wfile.flush()
+                if DEBUG_DIR:
+                    _debug_write("chat_stream_response.sse", "".join(debug_chunks))
             except Exception as e:
                 if VERBOSE:
                     print(f"[grok-launch] error during stream forwarding: {e}", file=sys.stderr)
@@ -815,17 +912,18 @@ class TranslationProxy(BaseHTTPRequestHandler):
         if WIRE_API == "responses":
             url = build_upstream_url(self.path)
             wants_stream = self.headers.get("Accept") == "text/event-stream" or payload.get("stream") == True
+            upstream_body = payload_with_upstream_model(payload)
 
             upstream_resp = None
             last_error = None
             for attempt in range(len(API_KEYS)):
                 active_key = get_active_key()
                 if VERBOSE:
-                    print(f"[grok-launch] forwarding responses directly to: {url} stream={wants_stream} key={active_key[:10]}...", file=sys.stderr)
+                    print(f"[grok-launch] forwarding responses directly to: {url} stream={wants_stream} model={TARGET_MODEL} key={active_key[:10]}...", file=sys.stderr)
 
                 upstream_req = urllib.request.Request(
                     url,
-                    data=body_bytes,
+                    data=upstream_body,
                     headers={
                         "Content-Type": self.headers.get("Content-Type", "application/json"),
                         "Authorization": f"Bearer {active_key}",
@@ -1015,10 +1113,10 @@ def main() -> None:
                 model_override = args[idx + 1]
                 break
 
-    active_model = model_override if model_override else TARGET_MODEL
+    cli_model = model_override if model_override else GROK_LAUNCH_CLI_MODEL
 
-    if not model_override:
-        args = ["--model", active_model] + args
+    if not model_override and cli_model:
+        args = ["--model", cli_model] + args
 
     env = os.environ.copy()
     env["GROK_CLI_CHAT_PROXY_BASE_URL"] = f"http://127.0.0.1:{port}/v1"
@@ -1030,7 +1128,8 @@ def main() -> None:
         print(
             f"[grok-launch] proxy=http://127.0.0.1:{port} "
             f"upstream={TARGET_BASE_URL} "
-            f"active_model={active_model}\n"
+            f"cli_model={cli_model} "
+            f"upstream_model={TARGET_MODEL}\n"
             f"[grok-launch] env files: {env_note}",
             file=sys.stderr,
         )
