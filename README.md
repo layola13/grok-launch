@@ -56,6 +56,7 @@ For streaming request execution (`stream: true`), the proxy converts the increme
 ```bash
 ./install.sh
 ```
+`./install.sh` also auto-installs the upstream CLI when it is missing (use `--skip-cli` to opt out).
 
 ### 2. Edit user config
 

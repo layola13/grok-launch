@@ -22,6 +22,7 @@ Options:
   --config-dir DIR  Config directory (default: ~/.config/grok-launch)
   --force-env       Overwrite existing user .env from .env.example
   --no-env          Skip creating user .env
+  --skip-cli        Do not auto-install the upstream CLI if missing
   --link            Symlink package grok-launch instead of a small wrapper
   -h, --help        Show this help
 
@@ -33,6 +34,7 @@ EOF
 }
 
 FORCE_ENV=0
+SKIP_CLI=0
 NO_ENV=0
 USE_LINK=0
 
@@ -42,11 +44,14 @@ while [[ $# -gt 0 ]]; do
     --config-dir) CONFIG_DIR="$2"; USER_ENV="$CONFIG_DIR/.env"; shift 2 ;;
     --force-env) FORCE_ENV=1; shift ;;
     --no-env) NO_ENV=1; shift ;;
-    --link) USE_LINK=1; shift ;;
+    --skip-cli) SKIP_CLI=1; shift ;;
+ --link) USE_LINK=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 1 ;;
   esac
 done
+
+
 
 WRAPPER="$BIN_DIR/grok-launch"
 USER_ENV="$CONFIG_DIR/.env"
@@ -62,6 +67,89 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 mkdir -p "$BIN_DIR" "$CONFIG_DIR"
+
+# --- ensure required CLI is installed (auto-install when missing) ---
+ensure_path_bin() {
+  local dir="$1"
+  [[ -n "${dir:-}" ]] || return 0
+  case ":$PATH:" in
+    *":$dir:"*) ;;
+    *) export PATH="$dir:$PATH" ;;
+  esac
+}
+
+have_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+run_npm_global() {
+  local pkg="$1"
+  if ! have_cmd npm; then
+    echo "error: npm is required to install $pkg. Install Node.js/npm first:" >&2
+    echo "  https://nodejs.org/  or  https://docs.npmjs.com/downloading-and-installing-node-js-and-npm" >&2
+    return 1
+  fi
+  echo "installing CLI via npm: $pkg"
+  if [[ "$(id -u)" -ne 0 ]]; then
+    npm install -g "$pkg" --prefix "${HOME}/.local" || npm install -g "$pkg"
+  else
+    npm install -g "$pkg" || {
+      echo "retry npm install with --prefix ${HOME}/.local"
+      npm install -g "$pkg" --prefix "${HOME}/.local"
+    }
+  fi
+  local npm_bin
+  npm_bin="$(npm prefix -g 2>/dev/null)/bin"
+  [[ -d "$npm_bin" ]] && ensure_path_bin "$npm_bin"
+  ensure_path_bin "${HOME}/.local/bin"
+  hash -r 2>/dev/null || true
+}
+
+run_curl_bash() {
+  local url="$1"
+  local label="$2"
+  if ! have_cmd curl && ! have_cmd wget; then
+    echo "error: curl or wget required to install $label" >&2
+    return 1
+  fi
+  echo "installing $label via $url"
+  if have_cmd curl; then
+    curl -fsSL "$url" | bash
+  else
+    wget -qO- "$url" | bash
+  fi
+  ensure_path_bin "${HOME}/.local/bin"
+  ensure_path_bin "${HOME}/.grok/bin"
+  hash -r 2>/dev/null || true
+}
+
+ensure_required_cli() {
+  if [[ "${SKIP_CLI:-0}" -eq 1 ]]; then
+    echo "skip CLI auto-install (--skip-cli)"
+    return 0
+  fi
+  ensure_path_bin "${HOME}/.local/bin"
+  ensure_path_bin "${BIN_DIR:-${HOME}/.local/bin}"
+  if have_cmd "grok"; then
+    echo "CLI present: grok -> $(command -v grok 2>/dev/null || command -v grok)"
+    return 0
+  fi
+  echo
+  echo "missing CLI: grok (Grok Build CLI)"
+  echo "docs: https://x.ai/cli"
+  echo "attempting automatic install..."
+
+  run_curl_bash "https://x.ai/cli/install.sh" "Grok Build CLI"
+  ensure_path_bin "${HOME}/.grok/bin"
+  ensure_path_bin "${HOME}/.local/bin"
+  if ! have_cmd grok; then
+    echo "error: 'grok' still not on PATH after install. See https://x.ai/cli" >&2
+    return 1
+  fi
+  echo "ok: $(command -v grok)"
+
+}
+
 
 chmod +x "$ROOT/main.py"
 
@@ -109,10 +197,9 @@ case ":$PATH:" in
     ;;
 esac
 
-if ! command -v grok >/dev/null 2>&1; then
-  echo
-  echo "warning: 'grok' not found on PATH. Install Grok Build CLI first."
-fi
+
+
+ensure_required_cli
 
 echo
 echo "Done."
