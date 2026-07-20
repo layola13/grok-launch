@@ -28,12 +28,14 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _REQUIRED_KEYS = (
     "GROK_LAUNCH_BASE_URL",
     "GROK_LAUNCH_MODEL",
-    "GROK_LAUNCH_API_KEY",
 )
 
 TARGET_BASE_URL: str = ""
 TARGET_MODEL: str = ""
 TARGET_API_KEY: str = ""
+API_KEYS: list[str] = []
+FROZEN_KEYS: dict[str, float] = {}
+FROZEN_LOCK = threading.Lock()
 GROK_LAUNCH_CLI_MODEL: str = "gpt-4o"
 GROK_BIN: str = "grok"
 VERBOSE: bool = False
@@ -43,6 +45,42 @@ WIRE_API: str = "responses"
 REASONING_EFFORT: str = ""
 MAX_COMPLETION_TOKENS: int = 0
 MAX_TOKENS: int = 0
+import time
+
+def get_active_key() -> str:
+    with FROZEN_LOCK:
+        now = time.time()
+        for key in API_KEYS:
+            if FROZEN_KEYS.get(key, 0) <= now:
+                return key
+        
+        candidates = []
+        for key in API_KEYS:
+            expire = FROZEN_KEYS.get(key, 0)
+            if expire - now < 43200: # less than 12 hours
+                candidates.append((expire, key))
+                
+        if candidates:
+            candidates.sort()
+            expire, key = candidates[0]
+            FROZEN_KEYS[key] = 0
+            return key
+            
+        return API_KEYS[0]
+
+
+def mark_key_failed(key: str, status_code: int) -> None:
+    with FROZEN_LOCK:
+        now = time.time()
+        if status_code == 429:
+            FROZEN_KEYS[key] = now + 60
+            print(f"[grok-launch] key {key[:10]}... frozen temporarily (429 rate limit) for 60s", file=sys.stderr)
+        elif status_code in (401, 402):
+            FROZEN_KEYS[key] = now + 86400
+            print(f"[grok-launch] key {key[:10]}... frozen permanently (401/402 auth error)", file=sys.stderr)
+        elif status_code in (502, 503, 504):
+            FROZEN_KEYS[key] = now + 30
+            print(f"[grok-launch] key {key[:10]}... frozen temporarily ({status_code} server error) for 30s", file=sys.stderr)
 
 
 def _parse_dotenv(path: str) -> dict[str, str]:
@@ -127,13 +165,18 @@ def load_dotenv_files() -> list[str]:
 
 
 def load_config() -> None:
-    global TARGET_BASE_URL, TARGET_MODEL, TARGET_API_KEY
+    global TARGET_BASE_URL, TARGET_MODEL, TARGET_API_KEY, API_KEYS
     global GROK_LAUNCH_CLI_MODEL, GROK_BIN, VERBOSE, DEBUG_DIR, _LOADED_ENV_FILES, WIRE_API
     global REASONING_EFFORT, MAX_COMPLETION_TOKENS, MAX_TOKENS
 
     _LOADED_ENV_FILES = load_dotenv_files()
 
     missing = [k for k in _REQUIRED_KEYS if not (os.environ.get(k) or "").strip()]
+    keys_str = os.environ.get("GROK_LAUNCH_API_KEYS") or os.environ.get("GROK_LAUNCH_API_KEY") or ""
+    API_KEYS = [k.strip() for k in keys_str.split(",") if k.strip()]
+    if not API_KEYS:
+        missing.append("GROK_LAUNCH_API_KEY (or GROK_LAUNCH_API_KEYS)")
+
     if missing:
         example = os.path.join(_HERE, ".env.example")
         xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
@@ -153,7 +196,7 @@ def load_config() -> None:
 
     TARGET_BASE_URL = os.environ["GROK_LAUNCH_BASE_URL"].strip().rstrip("/")
     TARGET_MODEL = os.environ["GROK_LAUNCH_MODEL"].strip()
-    TARGET_API_KEY = os.environ["GROK_LAUNCH_API_KEY"].strip()
+    TARGET_API_KEY = API_KEYS[0]
     GROK_LAUNCH_CLI_MODEL = (os.environ.get("GROK_LAUNCH_CLI_MODEL") or "gpt-4o").strip()
     GROK_BIN = (os.environ.get("GROK_BIN") or "grok").strip()
     VERBOSE = (os.environ.get("GROK_LAUNCH_VERBOSE") or "").strip() in ("1", "true", "yes", "on")
@@ -612,28 +655,41 @@ class TranslationProxy(BaseHTTPRequestHandler):
         self.send_error(404, "Not Found")
 
     def _handle_models(self) -> None:
-        url = build_upstream_url(self.path)
-        req = urllib.request.Request(
-            url,
-            headers={
-                "Authorization": f"Bearer {TARGET_API_KEY}",
-                "User-Agent": "grok-launch/1.0",
-            },
-            method="GET",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = resp.read()
-                self.send_response(resp.status)
-                self.send_header("Content-Type", resp.headers.get("Content-Type", "application/json"))
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-                return
-        except Exception as e:
-            if VERBOSE:
-                print(f"[grok-launch] models endpoint failed: {e}. returning mock model list.", file=sys.stderr)
+        for attempt in range(len(API_KEYS)):
+            active_key = get_active_key()
+            url = build_upstream_url(self.path)
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "Authorization": f"Bearer {active_key}",
+                    "User-Agent": "grok-launch/1.0",
+                },
+                method="GET",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = resp.read()
+                    self.send_response(resp.status)
+                    self.send_header("Content-Type", resp.headers.get("Content-Type", "application/json"))
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+            except urllib.error.HTTPError as exc:
+                mark_key_failed(active_key, exc.code)
+                if exc.code in (401, 402, 429, 502, 503, 504) and attempt < len(API_KEYS) - 1:
+                    if VERBOSE:
+                        print(f"[grok-launch] retrying models endpoint with next key due to status {exc.code}...", file=sys.stderr)
+                    continue
+                if VERBOSE:
+                    print(f"[grok-launch] models endpoint failed: {exc}. returning mock model list.", file=sys.stderr)
+                break
+            except Exception as e:
+                if VERBOSE:
+                    print(f"[grok-launch] models endpoint failed: {e}. returning mock model list.", file=sys.stderr)
+                break
 
+        # Fallback Mock
         mock_data = {
             "object": "list",
             "data": [
@@ -664,39 +720,53 @@ class TranslationProxy(BaseHTTPRequestHandler):
         url = build_upstream_url(self.path)
         wants_stream = self.headers.get("Accept") == "text/event-stream" or payload.get("stream") == True
 
-        if VERBOSE:
-            print(f"[grok-launch] forwarding chat completions directly to: {url} stream={wants_stream}", file=sys.stderr)
+        upstream_resp = None
+        last_error = None
+        for attempt in range(len(API_KEYS)):
+            active_key = get_active_key()
+            if VERBOSE:
+                print(f"[grok-launch] forwarding chat completions directly to: {url} stream={wants_stream} key={active_key[:10]}...", file=sys.stderr)
 
-        upstream_req = urllib.request.Request(
-            url,
-            data=body_bytes,
-            headers={
-                "Content-Type": self.headers.get("Content-Type", "application/json"),
-                "Authorization": f"Bearer {TARGET_API_KEY}",
-                "Accept": "text/event-stream" if wants_stream else "application/json",
-                "User-Agent": "grok-launch/1.0",
-            },
-            method="POST",
-        )
-        try:
-            upstream_resp = urllib.request.urlopen(upstream_req, timeout=300)
-        except urllib.error.HTTPError as exc:
+            upstream_req = urllib.request.Request(
+                url,
+                data=body_bytes,
+                headers={
+                    "Content-Type": self.headers.get("Content-Type", "application/json"),
+                    "Authorization": f"Bearer {active_key}",
+                    "Accept": "text/event-stream" if wants_stream else "application/json",
+                    "User-Agent": "grok-launch/1.0",
+                },
+                method="POST",
+            )
             try:
-                err_body = exc.read().decode("utf-8", errors="replace")
-            except Exception:
-                err_body = ""
-            print(f"[grok-launch] Upstream error {exc.code}: {err_body}", file=sys.stderr)
-            self.send_response(exc.code)
+                upstream_resp = urllib.request.urlopen(upstream_req, timeout=300)
+                break
+            except urllib.error.HTTPError as exc:
+                mark_key_failed(active_key, exc.code)
+                last_error = exc
+                if exc.code in (401, 402, 429, 502, 503, 504) and attempt < len(API_KEYS) - 1:
+                    if VERBOSE:
+                        print(f"[grok-launch] retrying chat completions with next key due to status {exc.code}...", file=sys.stderr)
+                    continue
+                break
+            except Exception as e:
+                last_error = e
+                break
+
+        if not upstream_resp:
+            code = 502
+            msg = str(last_error)
+            if isinstance(last_error, urllib.error.HTTPError):
+                code = last_error.code
+                try:
+                    msg = last_error.read().decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+            print(f"[grok-launch] Chat completions forwarding failed: {msg}", file=sys.stderr)
+            self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({"error": {"message": f"Upstream error: {err_body}"}}).encode("utf-8"))
-            return
-        except Exception as e:
-            print(f"[grok-launch] Upstream connection failed: {e}", file=sys.stderr)
-            self.send_response(502)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": {"message": f"Bad Gateway: {e}"}}).encode("utf-8"))
+            self.wfile.write(json.dumps({"error": {"message": f"Chat completions forwarding failed: {msg}"}}).encode("utf-8"))
             return
 
         if wants_stream:
@@ -746,39 +816,53 @@ class TranslationProxy(BaseHTTPRequestHandler):
             url = build_upstream_url(self.path)
             wants_stream = self.headers.get("Accept") == "text/event-stream" or payload.get("stream") == True
 
-            if VERBOSE:
-                print(f"[grok-launch] forwarding responses directly to: {url} stream={wants_stream}", file=sys.stderr)
+            upstream_resp = None
+            last_error = None
+            for attempt in range(len(API_KEYS)):
+                active_key = get_active_key()
+                if VERBOSE:
+                    print(f"[grok-launch] forwarding responses directly to: {url} stream={wants_stream} key={active_key[:10]}...", file=sys.stderr)
 
-            upstream_req = urllib.request.Request(
-                url,
-                data=body_bytes,
-                headers={
-                    "Content-Type": self.headers.get("Content-Type", "application/json"),
-                    "Authorization": f"Bearer {TARGET_API_KEY}",
-                    "Accept": "text/event-stream" if wants_stream else "application/json",
-                    "User-Agent": "grok-launch/1.0",
-                },
-                method="POST",
-            )
-            try:
-                upstream_resp = urllib.request.urlopen(upstream_req, timeout=300)
-            except urllib.error.HTTPError as exc:
+                upstream_req = urllib.request.Request(
+                    url,
+                    data=body_bytes,
+                    headers={
+                        "Content-Type": self.headers.get("Content-Type", "application/json"),
+                        "Authorization": f"Bearer {active_key}",
+                        "Accept": "text/event-stream" if wants_stream else "application/json",
+                        "User-Agent": "grok-launch/1.0",
+                    },
+                    method="POST",
+                )
                 try:
-                    err_body = exc.read().decode("utf-8", errors="replace")
-                except Exception:
-                    err_body = ""
-                print(f"[grok-launch] Upstream error {exc.code}: {err_body}", file=sys.stderr)
-                self.send_response(exc.code)
+                    upstream_resp = urllib.request.urlopen(upstream_req, timeout=300)
+                    break
+                except urllib.error.HTTPError as exc:
+                    mark_key_failed(active_key, exc.code)
+                    last_error = exc
+                    if exc.code in (401, 402, 429, 502, 503, 504) and attempt < len(API_KEYS) - 1:
+                        if VERBOSE:
+                            print(f"[grok-launch] retrying responses with next key due to status {exc.code}...", file=sys.stderr)
+                        continue
+                    break
+                except Exception as e:
+                    last_error = e
+                    break
+
+            if not upstream_resp:
+                code = 502
+                msg = str(last_error)
+                if isinstance(last_error, urllib.error.HTTPError):
+                    code = last_error.code
+                    try:
+                        msg = last_error.read().decode("utf-8", errors="replace")
+                    except Exception:
+                        pass
+                print(f"[grok-launch] Responses direct forwarding failed: {msg}", file=sys.stderr)
+                self.send_response(code)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(json.dumps({"error": {"message": f"Upstream error: {err_body}"}}).encode("utf-8"))
-                return
-            except Exception as e:
-                print(f"[grok-launch] Upstream connection failed: {e}", file=sys.stderr)
-                self.send_response(502)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": {"message": f"Bad Gateway: {e}"}}).encode("utf-8"))
+                self.wfile.write(json.dumps({"error": {"message": f"Forwarding failed: {msg}"}}).encode("utf-8"))
                 return
 
             if wants_stream:
@@ -818,42 +902,55 @@ class TranslationProxy(BaseHTTPRequestHandler):
 
         chat_payload = responses_request_to_chat(payload, TARGET_MODEL)
         wants_stream = bool(chat_payload.get("stream"))
-
-        if VERBOSE:
-            print(f"[grok-launch] responses -> chat/completions model={TARGET_MODEL} stream={wants_stream}", file=sys.stderr)
-
         url = build_upstream_url("/v1/chat/completions")
-        upstream_req = urllib.request.Request(
-            url,
-            data=json.dumps(chat_payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {TARGET_API_KEY}",
-                "Accept": "text/event-stream" if wants_stream else "application/json",
-                "User-Agent": "grok-launch/1.0",
-            },
-            method="POST",
-        )
 
-        try:
-            upstream_resp = urllib.request.urlopen(upstream_req, timeout=300)
-        except urllib.error.HTTPError as exc:
+        upstream_resp = None
+        last_error = None
+        for attempt in range(len(API_KEYS)):
+            active_key = get_active_key()
+            if VERBOSE:
+                print(f"[grok-launch] responses -> chat/completions model={TARGET_MODEL} stream={wants_stream} key={active_key[:10]}...", file=sys.stderr)
+
+            upstream_req = urllib.request.Request(
+                url,
+                data=json.dumps(chat_payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {active_key}",
+                    "Accept": "text/event-stream" if wants_stream else "application/json",
+                    "User-Agent": "grok-launch/1.0",
+                },
+                method="POST",
+            )
             try:
-                err_body = exc.read().decode("utf-8", errors="replace")
-            except Exception:
-                err_body = ""
-            print(f"[grok-launch] Upstream error {exc.code}: {err_body}", file=sys.stderr)
-            self.send_response(exc.code)
+                upstream_resp = urllib.request.urlopen(upstream_req, timeout=300)
+                break
+            except urllib.error.HTTPError as exc:
+                mark_key_failed(active_key, exc.code)
+                last_error = exc
+                if exc.code in (401, 402, 429, 502, 503, 504) and attempt < len(API_KEYS) - 1:
+                    if VERBOSE:
+                        print(f"[grok-launch] retrying responses translation with next key due to status {exc.code}...", file=sys.stderr)
+                    continue
+                break
+            except Exception as e:
+                last_error = e
+                break
+
+        if not upstream_resp:
+            code = 502
+            msg = str(last_error)
+            if isinstance(last_error, urllib.error.HTTPError):
+                code = last_error.code
+                try:
+                    msg = last_error.read().decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+            print(f"[grok-launch] Chat completions forwarding failed: {msg}", file=sys.stderr)
+            self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({"error": {"message": f"Upstream error: {err_body}"}}).encode("utf-8"))
-            return
-        except Exception as e:
-            print(f"[grok-launch] Upstream connection failed: {e}", file=sys.stderr)
-            self.send_response(502)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": {"message": f"Bad Gateway: {e}"}}).encode("utf-8"))
+            self.wfile.write(json.dumps({"error": {"message": f"Chat completions forwarding failed: {msg}"}}).encode("utf-8"))
             return
 
         if wants_stream:

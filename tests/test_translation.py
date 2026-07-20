@@ -202,9 +202,33 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(tool_done_event[0]["data"]["item"]["call_id"], "call_999")
         self.assertEqual(tool_done_event[0]["data"]["item"]["name"], "exec_command")
 
+        # Text done
         text_done_event = [e for e in events if e["event"] == "response.output_text.done"]
         self.assertEqual(len(text_done_event), 1)
         self.assertEqual(text_done_event[0]["data"]["text"], "Hello world")
+
+    def test_key_rotation(self) -> None:
+        main.API_KEYS = ["key1", "key2", "key3"]
+        main.FROZEN_KEYS = {}
+
+        # 1. Initially first key is returned
+        self.assertEqual(main.get_active_key(), "key1")
+
+        # 2. Freeze key1 temporarily
+        main.mark_key_failed("key1", 429)
+        self.assertEqual(main.get_active_key(), "key2")
+
+        # 3. Freeze key2 permanently
+        main.mark_key_failed("key2", 401)
+        self.assertEqual(main.get_active_key(), "key3")
+
+        # 4. If all keys are frozen, the one that expires earliest (key1) is chosen
+        main.mark_key_failed("key3", 429)
+        self.assertEqual(main.get_active_key(), "key1")
+
+        # Clean up
+        main.API_KEYS = ["mock-key"]
+        main.FROZEN_KEYS = {}
 
 
 if __name__ == "__main__":
