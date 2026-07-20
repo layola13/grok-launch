@@ -40,6 +40,9 @@ VERBOSE: bool = False
 DEBUG_DIR: str = ""
 _LOADED_ENV_FILES: list[str] = []
 WIRE_API: str = "responses"
+REASONING_EFFORT: str = ""
+MAX_COMPLETION_TOKENS: int = 0
+MAX_TOKENS: int = 0
 
 
 def _parse_dotenv(path: str) -> dict[str, str]:
@@ -126,6 +129,7 @@ def load_dotenv_files() -> list[str]:
 def load_config() -> None:
     global TARGET_BASE_URL, TARGET_MODEL, TARGET_API_KEY
     global GROK_LAUNCH_CLI_MODEL, GROK_BIN, VERBOSE, DEBUG_DIR, _LOADED_ENV_FILES, WIRE_API
+    global REASONING_EFFORT, MAX_COMPLETION_TOKENS, MAX_TOKENS
 
     _LOADED_ENV_FILES = load_dotenv_files()
 
@@ -161,6 +165,17 @@ def load_config() -> None:
     if WIRE_API not in ("responses", "chat"):
         print(f"warning: unknown GROK_LAUNCH_WIRE_API value '{WIRE_API}'. defaulting to 'responses'.", file=sys.stderr)
         WIRE_API = "responses"
+    REASONING_EFFORT = (os.environ.get("GROK_LAUNCH_REASONING_EFFORT") or "").strip().lower()
+    try:
+        MAX_COMPLETION_TOKENS = int(os.environ.get("GROK_LAUNCH_MAX_COMPLETION_TOKENS") or "0")
+    except ValueError:
+        print("warning: GROK_LAUNCH_MAX_COMPLETION_TOKENS must be an integer", file=sys.stderr)
+        MAX_COMPLETION_TOKENS = 0
+    try:
+        MAX_TOKENS = int(os.environ.get("GROK_LAUNCH_MAX_TOKENS") or "0")
+    except ValueError:
+        print("warning: GROK_LAUNCH_MAX_TOKENS must be an integer", file=sys.stderr)
+        MAX_TOKENS = 0
 
 
 def build_upstream_url(path: str) -> str:
@@ -360,9 +375,16 @@ def responses_request_to_chat(payload: dict[str, Any], active_model: str) -> dic
         out_payload["tools"] = openai_tools
         out_payload["tool_choice"] = "auto"
 
-    for key in ("temperature", "top_p", "presence_penalty", "frequency_penalty", "max_tokens", "max_completion_tokens"):
+    for key in ("temperature", "top_p", "presence_penalty", "frequency_penalty", "max_tokens", "max_completion_tokens", "reasoning_effort"):
         if key in payload:
             out_payload[key] = payload[key]
+
+    if "reasoning_effort" not in out_payload and REASONING_EFFORT:
+        out_payload["reasoning_effort"] = REASONING_EFFORT
+    if "max_completion_tokens" not in out_payload and MAX_COMPLETION_TOKENS > 0:
+        out_payload["max_completion_tokens"] = MAX_COMPLETION_TOKENS
+    if "max_tokens" not in out_payload and MAX_TOKENS > 0:
+        out_payload["max_tokens"] = MAX_TOKENS
 
     return out_payload
 

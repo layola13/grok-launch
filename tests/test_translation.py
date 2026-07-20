@@ -95,6 +95,27 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(tools[0]["function"]["name"], "fs__read_file")
         self.assertEqual(tools[0]["function"]["description"], "Read file content")
 
+        # Test reasoning effort and token limit copying & defaulting
+        payload_with_effort = {"model": "gpt-4o", "reasoning_effort": "high"}
+        res = main.responses_request_to_chat(payload_with_effort, "gpt-4o")
+        self.assertEqual(res.get("reasoning_effort"), "high")
+
+        # Test defaulting fallback values
+        main.REASONING_EFFORT = "low"
+        main.MAX_COMPLETION_TOKENS = 4000
+        main.MAX_TOKENS = 8000
+        
+        payload_empty = {"model": "gpt-4o"}
+        res_defaulted = main.responses_request_to_chat(payload_empty, "gpt-4o")
+        self.assertEqual(res_defaulted.get("reasoning_effort"), "low")
+        self.assertEqual(res_defaulted.get("max_completion_tokens"), 4000)
+        self.assertEqual(res_defaulted.get("max_tokens"), 8000)
+
+        # Cleanup globals
+        main.REASONING_EFFORT = ""
+        main.MAX_COMPLETION_TOKENS = 0
+        main.MAX_TOKENS = 0
+
     def test_chat_response_to_responses(self) -> None:
         chat_resp = {
             "choices": [
