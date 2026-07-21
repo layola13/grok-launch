@@ -10,16 +10,19 @@ No secrets are hard-coded; configuration is managed through environment variable
 
 from __future__ import annotations
 
+from email.utils import parsedate_to_datetime
 import os
 import sys
 import json
 import uuid
+import random
 import socket
 import urllib.request
 import urllib.error
 import subprocess
 import threading
 import tempfile
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Generator
 
@@ -45,7 +48,107 @@ WIRE_API: str = "chat"
 REASONING_EFFORT: str = ""
 MAX_COMPLETION_TOKENS: int = 0
 MAX_TOKENS: int = 0
-import time
+UPSTREAM_USER_AGENT: str = "grok-launch/1.0"
+UPSTREAM_MIN_INTERVAL_SECONDS: float = 0.25
+UPSTREAM_RETRIES: int = 2
+UPSTREAM_429_FREEZE_SECONDS: float = 60.0
+UPSTREAM_5XX_FREEZE_SECONDS: float = 30.0
+UPSTREAM_MAX_RETRY_AFTER_SECONDS: float = 300.0
+UPSTREAM_BACKOFF_INITIAL_SECONDS: float = 1.0
+UPSTREAM_BACKOFF_MAX_SECONDS: float = 30.0
+UPSTREAM_NEXT_REQUEST_AT: float = 0.0
+UPSTREAM_COOLDOWN_UNTIL: float = 0.0
+UPSTREAM_THROTTLE_LOCK = threading.Lock()
+
+def _bounded_float(value: str | None, default: float, *, minimum: float = 0.0) -> float:
+    try:
+        parsed = float(value) if value is not None and value.strip() else default
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, parsed)
+
+
+def _bounded_int(value: str | None, default: int, *, minimum: int = 0) -> int:
+    try:
+        parsed = int(value) if value is not None and value.strip() else default
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, parsed)
+
+
+def _parse_retry_after(value: str | None, *, now: float | None = None) -> float | None:
+    if not value:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        dt = parsedate_to_datetime(raw)
+        if dt is None:
+            return None
+        return max(0.0, dt.timestamp() - (time.time() if now is None else now))
+    except Exception:
+        return None
+
+
+def _clamp_retry_delay(delay: float | None, fallback: float) -> float:
+    selected = fallback if delay is None else delay
+    return min(max(0.0, selected), UPSTREAM_MAX_RETRY_AFTER_SECONDS)
+
+
+def _retry_backoff_seconds(attempt: int) -> float:
+    base = min(UPSTREAM_BACKOFF_MAX_SECONDS, UPSTREAM_BACKOFF_INITIAL_SECONDS * (2 ** max(0, attempt)))
+    return base + random.uniform(0.0, min(1.0, base * 0.25))
+
+
+def _apply_upstream_cooldown(seconds: float, reason: str) -> None:
+    if seconds <= 0:
+        return
+    capped = min(seconds, UPSTREAM_MAX_RETRY_AFTER_SECONDS)
+    with UPSTREAM_THROTTLE_LOCK:
+        global UPSTREAM_COOLDOWN_UNTIL
+        until = time.time() + capped
+        if until > UPSTREAM_COOLDOWN_UNTIL:
+            UPSTREAM_COOLDOWN_UNTIL = until
+    if VERBOSE:
+        print(f"[grok-launch] upstream cooldown {capped:.2f}s ({reason})", file=sys.stderr)
+
+
+def _wait_for_upstream_slot() -> None:
+    global UPSTREAM_NEXT_REQUEST_AT
+    while True:
+        with UPSTREAM_THROTTLE_LOCK:
+            now = time.time()
+            wait_until = max(UPSTREAM_COOLDOWN_UNTIL, UPSTREAM_NEXT_REQUEST_AT)
+            wait_for = wait_until - now
+            if wait_for <= 0:
+                UPSTREAM_NEXT_REQUEST_AT = now + UPSTREAM_MIN_INTERVAL_SECONDS
+                return
+        time.sleep(min(wait_for, 5.0))
+
+
+def _is_retryable_upstream_status(status_code: int) -> bool:
+    return status_code == 429 or 500 <= status_code <= 599
+
+
+def _compact_upstream_error(message: str, *, max_chars: int = 1000) -> str:
+    text = (message or "").strip()
+    lower = text.lower()
+    if "<html" in lower or "<!doctype html" in lower:
+        title = ""
+        title_start = lower.find("<title>")
+        title_end = lower.find("</title>")
+        if 0 <= title_start < title_end:
+            title = text[title_start + len("<title>"):title_end].strip()
+        text = f"HTML upstream error page: {title}" if title else "HTML upstream error page returned by gateway"
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "..."
+    return text
+
 
 def get_active_key() -> str:
     with FROZEN_LOCK:
@@ -69,18 +172,27 @@ def get_active_key() -> str:
         return API_KEYS[0]
 
 
-def mark_key_failed(key: str, status_code: int) -> None:
+def mark_key_failed(key: str, status_code: int, retry_after: str | None = None) -> float:
     with FROZEN_LOCK:
         now = time.time()
         if status_code == 429:
-            FROZEN_KEYS[key] = now + 60
-            print(f"[grok-launch] key {key[:10]}... frozen temporarily (429 rate limit) for 60s", file=sys.stderr)
+            freeze_for = _clamp_retry_delay(
+                _parse_retry_after(retry_after, now=now),
+                UPSTREAM_429_FREEZE_SECONDS,
+            )
+            FROZEN_KEYS[key] = now + freeze_for
+            print(f"[grok-launch] key {key[:10]}... frozen temporarily (429 rate limit) for {freeze_for:.0f}s", file=sys.stderr)
+            return freeze_for
         elif status_code in (401, 402):
             FROZEN_KEYS[key] = now + 86400
             print(f"[grok-launch] key {key[:10]}... frozen permanently (401/402 auth error)", file=sys.stderr)
-        elif status_code in (502, 503, 504):
-            FROZEN_KEYS[key] = now + 30
-            print(f"[grok-launch] key {key[:10]}... frozen temporarily ({status_code} server error) for 30s", file=sys.stderr)
+            return 86400.0
+        elif 500 <= status_code <= 599:
+            freeze_for = UPSTREAM_5XX_FREEZE_SECONDS
+            FROZEN_KEYS[key] = now + freeze_for
+            print(f"[grok-launch] key {key[:10]}... frozen temporarily ({status_code} server error) for {freeze_for:.0f}s", file=sys.stderr)
+            return freeze_for
+    return 0.0
 
 
 def _parse_dotenv(path: str) -> dict[str, str]:
@@ -168,6 +280,10 @@ def load_config() -> None:
     global TARGET_BASE_URL, TARGET_MODEL, TARGET_API_KEY, API_KEYS
     global GROK_LAUNCH_CLI_MODEL, GROK_BIN, VERBOSE, DEBUG_DIR, _LOADED_ENV_FILES, WIRE_API
     global REASONING_EFFORT, MAX_COMPLETION_TOKENS, MAX_TOKENS
+    global UPSTREAM_USER_AGENT, UPSTREAM_MIN_INTERVAL_SECONDS, UPSTREAM_RETRIES
+    global UPSTREAM_429_FREEZE_SECONDS, UPSTREAM_5XX_FREEZE_SECONDS
+    global UPSTREAM_MAX_RETRY_AFTER_SECONDS, UPSTREAM_BACKOFF_INITIAL_SECONDS
+    global UPSTREAM_BACKOFF_MAX_SECONDS
 
     _LOADED_ENV_FILES = load_dotenv_files()
 
@@ -208,6 +324,14 @@ def load_config() -> None:
     if WIRE_API not in ("responses", "chat"):
         print(f"warning: unknown GROK_LAUNCH_WIRE_API value '{WIRE_API}'. defaulting to 'chat'.", file=sys.stderr)
         WIRE_API = "chat"
+    UPSTREAM_USER_AGENT = (os.environ.get("GROK_LAUNCH_USER_AGENT") or "grok-launch/1.0").strip()
+    UPSTREAM_MIN_INTERVAL_SECONDS = _bounded_float(os.environ.get("GROK_LAUNCH_UPSTREAM_MIN_INTERVAL_SECONDS"), 0.25)
+    UPSTREAM_RETRIES = _bounded_int(os.environ.get("GROK_LAUNCH_UPSTREAM_RETRIES"), 2)
+    UPSTREAM_429_FREEZE_SECONDS = _bounded_float(os.environ.get("GROK_LAUNCH_429_FREEZE_SECONDS"), 60.0)
+    UPSTREAM_5XX_FREEZE_SECONDS = _bounded_float(os.environ.get("GROK_LAUNCH_5XX_FREEZE_SECONDS"), 30.0)
+    UPSTREAM_MAX_RETRY_AFTER_SECONDS = _bounded_float(os.environ.get("GROK_LAUNCH_MAX_RETRY_AFTER_SECONDS"), 300.0)
+    UPSTREAM_BACKOFF_INITIAL_SECONDS = _bounded_float(os.environ.get("GROK_LAUNCH_BACKOFF_INITIAL_SECONDS"), 1.0)
+    UPSTREAM_BACKOFF_MAX_SECONDS = _bounded_float(os.environ.get("GROK_LAUNCH_BACKOFF_MAX_SECONDS"), 30.0)
     REASONING_EFFORT = (os.environ.get("GROK_LAUNCH_REASONING_EFFORT") or "").strip().lower()
     try:
         MAX_COMPLETION_TOKENS = int(os.environ.get("GROK_LAUNCH_MAX_COMPLETION_TOKENS") or "0")
@@ -239,6 +363,56 @@ def payload_with_upstream_model(payload: dict[str, Any]) -> bytes:
     upstream_payload = dict(payload)
     upstream_payload["model"] = TARGET_MODEL
     return json.dumps(upstream_payload).encode("utf-8")
+
+
+def _open_upstream_with_retries(
+    url: str,
+    *,
+    method: str,
+    headers: dict[str, str],
+    data: bytes | None = None,
+    timeout: int = 300,
+    label: str = "upstream",
+) -> Any:
+    last_error: Exception | None = None
+    max_attempts = max(len(API_KEYS), 1) + max(0, UPSTREAM_RETRIES)
+    for attempt in range(max_attempts):
+        active_key = get_active_key()
+        request_headers = dict(headers)
+        request_headers["Authorization"] = f"Bearer {active_key}"
+        request_headers.setdefault("User-Agent", UPSTREAM_USER_AGENT)
+        if VERBOSE:
+            print(f"[grok-launch] {label} request attempt={attempt + 1}/{max_attempts} key={active_key[:10]}...", file=sys.stderr)
+        req = urllib.request.Request(url, data=data, headers=request_headers, method=method)
+        try:
+            _wait_for_upstream_slot()
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            frozen_for = mark_key_failed(active_key, exc.code, retry_after)
+            last_error = exc
+            if exc.code == 429:
+                cooldown = _clamp_retry_delay(
+                    _parse_retry_after(retry_after),
+                    min(frozen_for or UPSTREAM_429_FREEZE_SECONDS, _retry_backoff_seconds(attempt)),
+                )
+                _apply_upstream_cooldown(cooldown, "429 rate limit")
+            elif 500 <= exc.code <= 599:
+                _apply_upstream_cooldown(_retry_backoff_seconds(attempt), f"{exc.code} upstream error")
+            if _is_retryable_upstream_status(exc.code) and attempt < max_attempts - 1:
+                continue
+            if exc.code in (401, 402) and attempt < min(len(API_KEYS), max_attempts) - 1:
+                continue
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempt < max_attempts - 1:
+                _apply_upstream_cooldown(_retry_backoff_seconds(attempt), "transport error")
+                continue
+            break
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("upstream request failed")
 
 
 def _debug_write(name: str, obj: Any) -> None:
@@ -743,39 +917,25 @@ class TranslationProxy(BaseHTTPRequestHandler):
         self.send_error(404, "Not Found")
 
     def _handle_models(self) -> None:
-        for attempt in range(len(API_KEYS)):
-            active_key = get_active_key()
-            url = build_upstream_url(self.path)
-            req = urllib.request.Request(
+        url = build_upstream_url(self.path)
+        try:
+            with _open_upstream_with_retries(
                 url,
-                headers={
-                    "Authorization": f"Bearer {active_key}",
-                    "User-Agent": "grok-launch/1.0",
-                },
                 method="GET",
-            )
-            try:
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    data = resp.read()
-                    self.send_response(resp.status)
-                    self.send_header("Content-Type", resp.headers.get("Content-Type", "application/json"))
-                    self.send_header("Content-Length", str(len(data)))
-                    self.end_headers()
-                    self.wfile.write(data)
-                    return
-            except urllib.error.HTTPError as exc:
-                mark_key_failed(active_key, exc.code)
-                if exc.code in (401, 402, 429, 502, 503, 504) and attempt < len(API_KEYS) - 1:
-                    if VERBOSE:
-                        print(f"[grok-launch] retrying models endpoint with next key due to status {exc.code}...", file=sys.stderr)
-                    continue
-                if VERBOSE:
-                    print(f"[grok-launch] models endpoint failed: {exc}. returning mock model list.", file=sys.stderr)
-                break
-            except Exception as e:
-                if VERBOSE:
-                    print(f"[grok-launch] models endpoint failed: {e}. returning mock model list.", file=sys.stderr)
-                break
+                headers={"User-Agent": UPSTREAM_USER_AGENT},
+                timeout=10,
+                label="models",
+            ) as resp:
+                data = resp.read()
+                self.send_response(resp.status)
+                self.send_header("Content-Type", resp.headers.get("Content-Type", "application/json"))
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+        except Exception as exc:
+            if VERBOSE:
+                print(f"[grok-launch] models endpoint failed: {_compact_upstream_error(str(exc))}. returning mock model list.", file=sys.stderr)
 
         # Fallback Mock
         mock_data = {
@@ -811,46 +971,26 @@ class TranslationProxy(BaseHTTPRequestHandler):
         _debug_write("chat_incoming_request.json", payload)
         _debug_write("chat_outgoing_request.json", json.loads(upstream_body.decode("utf-8")))
 
-        upstream_resp = None
-        last_error = None
-        for attempt in range(len(API_KEYS)):
-            active_key = get_active_key()
-            if VERBOSE:
-                print(f"[grok-launch] forwarding chat completions directly to: {url} stream={wants_stream} model={TARGET_MODEL} key={active_key[:10]}...", file=sys.stderr)
-
-            upstream_req = urllib.request.Request(
+        try:
+            upstream_resp = _open_upstream_with_retries(
                 url,
+                method="POST",
                 data=upstream_body,
                 headers={
                     "Content-Type": self.headers.get("Content-Type", "application/json"),
-                    "Authorization": f"Bearer {active_key}",
                     "Accept": "text/event-stream" if wants_stream else "application/json",
-                    "User-Agent": "grok-launch/1.0",
+                    "User-Agent": UPSTREAM_USER_AGENT,
                 },
-                method="POST",
+                timeout=300,
+                label="chat completions",
             )
-            try:
-                upstream_resp = urllib.request.urlopen(upstream_req, timeout=300)
-                break
-            except urllib.error.HTTPError as exc:
-                mark_key_failed(active_key, exc.code)
-                last_error = exc
-                if exc.code in (401, 402, 429, 502, 503, 504) and attempt < len(API_KEYS) - 1:
-                    if VERBOSE:
-                        print(f"[grok-launch] retrying chat completions with next key due to status {exc.code}...", file=sys.stderr)
-                    continue
-                break
-            except Exception as e:
-                last_error = e
-                break
-
-        if not upstream_resp:
+        except Exception as exc:
+            msg = _compact_upstream_error(str(exc))
             code = 502
-            msg = str(last_error)
-            if isinstance(last_error, urllib.error.HTTPError):
-                code = last_error.code
+            if isinstance(exc, urllib.error.HTTPError):
+                code = exc.code
                 try:
-                    msg = last_error.read().decode("utf-8", errors="replace")
+                    msg = _compact_upstream_error(exc.read().decode("utf-8", errors="replace"))
                 except Exception:
                     pass
             print(f"[grok-launch] Chat completions forwarding failed: {msg}", file=sys.stderr)
@@ -914,46 +1054,26 @@ class TranslationProxy(BaseHTTPRequestHandler):
             wants_stream = self.headers.get("Accept") == "text/event-stream" or payload.get("stream") == True
             upstream_body = payload_with_upstream_model(payload)
 
-            upstream_resp = None
-            last_error = None
-            for attempt in range(len(API_KEYS)):
-                active_key = get_active_key()
-                if VERBOSE:
-                    print(f"[grok-launch] forwarding responses directly to: {url} stream={wants_stream} model={TARGET_MODEL} key={active_key[:10]}...", file=sys.stderr)
-
-                upstream_req = urllib.request.Request(
+            try:
+                upstream_resp = _open_upstream_with_retries(
                     url,
+                    method="POST",
                     data=upstream_body,
                     headers={
                         "Content-Type": self.headers.get("Content-Type", "application/json"),
-                        "Authorization": f"Bearer {active_key}",
                         "Accept": "text/event-stream" if wants_stream else "application/json",
-                        "User-Agent": "grok-launch/1.0",
+                        "User-Agent": UPSTREAM_USER_AGENT,
                     },
-                    method="POST",
+                    timeout=300,
+                    label="responses direct",
                 )
-                try:
-                    upstream_resp = urllib.request.urlopen(upstream_req, timeout=300)
-                    break
-                except urllib.error.HTTPError as exc:
-                    mark_key_failed(active_key, exc.code)
-                    last_error = exc
-                    if exc.code in (401, 402, 429, 502, 503, 504) and attempt < len(API_KEYS) - 1:
-                        if VERBOSE:
-                            print(f"[grok-launch] retrying responses with next key due to status {exc.code}...", file=sys.stderr)
-                        continue
-                    break
-                except Exception as e:
-                    last_error = e
-                    break
-
-            if not upstream_resp:
+            except Exception as exc:
                 code = 502
-                msg = str(last_error)
-                if isinstance(last_error, urllib.error.HTTPError):
-                    code = last_error.code
+                msg = _compact_upstream_error(str(exc))
+                if isinstance(exc, urllib.error.HTTPError):
+                    code = exc.code
                     try:
-                        msg = last_error.read().decode("utf-8", errors="replace")
+                        msg = _compact_upstream_error(exc.read().decode("utf-8", errors="replace"))
                     except Exception:
                         pass
                 print(f"[grok-launch] Responses direct forwarding failed: {msg}", file=sys.stderr)
@@ -1002,46 +1122,26 @@ class TranslationProxy(BaseHTTPRequestHandler):
         wants_stream = bool(chat_payload.get("stream"))
         url = build_upstream_url("/v1/chat/completions")
 
-        upstream_resp = None
-        last_error = None
-        for attempt in range(len(API_KEYS)):
-            active_key = get_active_key()
-            if VERBOSE:
-                print(f"[grok-launch] responses -> chat/completions model={TARGET_MODEL} stream={wants_stream} key={active_key[:10]}...", file=sys.stderr)
-
-            upstream_req = urllib.request.Request(
+        try:
+            upstream_resp = _open_upstream_with_retries(
                 url,
+                method="POST",
                 data=json.dumps(chat_payload).encode("utf-8"),
                 headers={
                     "Content-Type": "application/json",
-                    "Authorization": f"Bearer {active_key}",
                     "Accept": "text/event-stream" if wants_stream else "application/json",
-                    "User-Agent": "grok-launch/1.0",
+                    "User-Agent": UPSTREAM_USER_AGENT,
                 },
-                method="POST",
+                timeout=300,
+                label="responses translation",
             )
-            try:
-                upstream_resp = urllib.request.urlopen(upstream_req, timeout=300)
-                break
-            except urllib.error.HTTPError as exc:
-                mark_key_failed(active_key, exc.code)
-                last_error = exc
-                if exc.code in (401, 402, 429, 502, 503, 504) and attempt < len(API_KEYS) - 1:
-                    if VERBOSE:
-                        print(f"[grok-launch] retrying responses translation with next key due to status {exc.code}...", file=sys.stderr)
-                    continue
-                break
-            except Exception as e:
-                last_error = e
-                break
-
-        if not upstream_resp:
+        except Exception as exc:
             code = 502
-            msg = str(last_error)
-            if isinstance(last_error, urllib.error.HTTPError):
-                code = last_error.code
+            msg = _compact_upstream_error(str(exc))
+            if isinstance(exc, urllib.error.HTTPError):
+                code = exc.code
                 try:
-                    msg = last_error.read().decode("utf-8", errors="replace")
+                    msg = _compact_upstream_error(exc.read().decode("utf-8", errors="replace"))
                 except Exception:
                     pass
             print(f"[grok-launch] Chat completions forwarding failed: {msg}", file=sys.stderr)
