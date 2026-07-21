@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from email.utils import parsedate_to_datetime
 import os
+import platform
 import sys
 import json
 import uuid
@@ -61,6 +62,9 @@ UPSTREAM_BACKOFF_MAX_SECONDS: float = 30.0
 UPSTREAM_NEXT_REQUEST_AT: float = 0.0
 UPSTREAM_COOLDOWN_UNTIL: float = 0.0
 UPSTREAM_THROTTLE_LOCK = threading.Lock()
+_CODEX_SESSION_ID = f"session-{uuid.uuid4()}"
+_CODEX_THREAD_ID = str(uuid.uuid4())
+_CODEX_INSTALLATION_ID = str(uuid.uuid4())
 
 def _bounded_float(value: str | None, default: float, *, minimum: float = 0.0) -> float:
     try:
@@ -76,6 +80,65 @@ def _bounded_int(value: str | None, default: int, *, minimum: int = 0) -> int:
     except (TypeError, ValueError):
         return default
     return max(minimum, parsed)
+
+
+def _env_truthy(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _codex_version() -> str:
+    configured = (os.environ.get("CODEX_VERSION") or "").strip()
+    if configured:
+        return configured
+    codex_bin = (os.environ.get("CODEX_BIN") or "codex").strip() or "codex"
+    try:
+        result = subprocess.run(
+            [codex_bin, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except Exception:
+        return "0.144.6"
+    for token in result.stdout.replace("v", " v").split():
+        candidate = token.lstrip("v")
+        parts = candidate.split(".")
+        if len(parts) >= 2 and all(part.isdigit() for part in parts[:2]):
+            return candidate
+    return "0.144.6"
+
+
+def _codex_user_agent() -> str:
+    originator = (os.environ.get("CODEX_ORIGINATOR") or "codex_cli_rs").strip() or "codex_cli_rs"
+    version = _codex_version()
+    system = platform.system() or "Unknown"
+    release = platform.release() or "unknown"
+    arch = platform.machine() or "unknown"
+    return f"{originator}/{version} ({system} {release}; {arch})"
+
+
+def _default_upstream_user_agent(fallback: str) -> str:
+    if _env_truthy("CODEX_HEAD"):
+        return (os.environ.get("CODEX_USER_AGENT") or _codex_user_agent()).strip()
+    return fallback
+
+
+def _with_codex_headers(headers: dict[str, str]) -> dict[str, str]:
+    if not _env_truthy("CODEX_HEAD"):
+        return headers
+
+    out = dict(headers)
+    out["User-Agent"] = out.get("User-Agent") or _codex_user_agent()
+    out.setdefault("Originator", (os.environ.get("CODEX_ORIGINATOR") or "codex_cli_rs").strip() or "codex_cli_rs")
+    out.setdefault("session-id", (os.environ.get("CODEX_SESSION_ID") or _CODEX_SESSION_ID).strip())
+    out.setdefault("thread-id", (os.environ.get("CODEX_THREAD_ID") or _CODEX_THREAD_ID).strip())
+    out.setdefault("x-codex-installation-id", (os.environ.get("CODEX_INSTALLATION_ID") or _CODEX_INSTALLATION_ID).strip())
+    beta = (os.environ.get("CODEX_OPENAI_BETA") or "").strip()
+    if beta:
+        out.setdefault("OpenAI-Beta", beta)
+    return out
 
 
 def _parse_retry_after(value: str | None, *, now: float | None = None) -> float | None:
@@ -330,7 +393,7 @@ def load_config() -> None:
     if WIRE_API not in ("responses", "chat"):
         print(f"warning: unknown GROK_LAUNCH_WIRE_API value '{WIRE_API}'. defaulting to 'chat'.", file=sys.stderr)
         WIRE_API = "chat"
-    UPSTREAM_USER_AGENT = (os.environ.get("GROK_LAUNCH_USER_AGENT") or "grok-launch/1.0").strip()
+    UPSTREAM_USER_AGENT = (os.environ.get("GROK_LAUNCH_USER_AGENT") or _default_upstream_user_agent("grok-launch/1.0")).strip()
     UPSTREAM_MIN_INTERVAL_SECONDS = _bounded_float(os.environ.get("GROK_LAUNCH_UPSTREAM_MIN_INTERVAL_SECONDS"), 0.25)
     UPSTREAM_RETRIES = _bounded_int(os.environ.get("GROK_LAUNCH_UPSTREAM_RETRIES"), 2)
     UPSTREAM_429_FREEZE_SECONDS = _bounded_float(os.environ.get("GROK_LAUNCH_429_FREEZE_SECONDS"), 60.0)
@@ -387,6 +450,7 @@ def _open_upstream_with_retries(
         request_headers = dict(headers)
         request_headers["Authorization"] = f"Bearer {active_key}"
         request_headers.setdefault("User-Agent", UPSTREAM_USER_AGENT)
+        request_headers = _with_codex_headers(request_headers)
         if VERBOSE:
             print(f"[grok-launch] {label} request attempt={attempt + 1}/{max_attempts} key={active_key[:10]}...", file=sys.stderr)
         req = urllib.request.Request(url, data=data, headers=request_headers, method=method)
