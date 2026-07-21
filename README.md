@@ -97,12 +97,14 @@ grok-launch -p "hello"
 
 ### `.env` load priority
 
-1. `GROK_LAUNCH_ENV`
-2. `./.env` or `./.grok-launch.env` (cwd)
-3. Parent directories (up to 6 levels)
-4. Package directory `.env`
+1. `GROK_LAUNCH_ENV` if set
+2. Package directory `.env` (launcher-local, next to `main.py`)
+3. `./.env` or `./.grok-launch.env` (cwd)
+4. Parent directories (up to 6 levels)
 5. `~/.config/grok-launch/.env`
 6. `~/.grok-launch.env`
+
+For grok-launch-managed keys (`GROK_LAUNCH_*` and `GROK_BIN`), higher-priority `.env` files override stale shell exports.
 
 ## Usage (same flags as grok)
 

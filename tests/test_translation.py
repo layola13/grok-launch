@@ -1,5 +1,6 @@
 import json
 import os
+import tempfile
 import sys
 import unittest
 import io
@@ -337,6 +338,88 @@ class TranslationTests(unittest.TestCase):
 
         self.assertEqual(cm.exception.code, 0)
         self.assertEqual(run_mock.call_args.args[0], ["grok", "--model", "custom-cli-model", "-p", "hello"])
+
+    def test_candidate_env_paths_prefers_launcher_env_over_cwd_and_user_env(self) -> None:
+        old_here = main._HERE
+        old_env = os.environ.copy()
+        old_cwd = os.getcwd()
+        try:
+            with tempfile.TemporaryDirectory() as cwd, tempfile.TemporaryDirectory() as home:
+                repo_dir = os.path.join(home, "repo", "grok-launch")
+                os.makedirs(repo_dir, exist_ok=True)
+                main._HERE = repo_dir
+                os.chdir(cwd)
+                os.environ.clear()
+                os.environ["HOME"] = home
+                paths = main._candidate_env_paths()
+                self.assertLess(
+                    paths.index(os.path.join(repo_dir, ".env")),
+                    paths.index(os.path.join(cwd, ".env")),
+                )
+                self.assertLess(
+                    paths.index(os.path.join(repo_dir, ".env")),
+                    paths.index(os.path.join(home, ".config", "grok-launch", ".env")),
+                )
+        finally:
+            main._HERE = old_here
+            os.chdir(old_cwd)
+            os.environ.clear()
+            os.environ.update(old_env)
+
+    def test_load_dotenv_files_launcher_env_overrides_stale_managed_env(self) -> None:
+        old_here = main._HERE
+        old_env = os.environ.copy()
+        old_cwd = os.getcwd()
+        try:
+            with tempfile.TemporaryDirectory() as cwd, tempfile.TemporaryDirectory() as repo_dir:
+                main._HERE = repo_dir
+                os.chdir(cwd)
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "GROK_LAUNCH_API_KEY": "old-exported-key",
+                        "GROK_LAUNCH_MODEL": "old-exported-model",
+                        "UNRELATED_SETTING": "shell-value",
+                    }
+                )
+                with open(os.path.join(repo_dir, ".env"), "w", encoding="utf-8") as f:
+                    f.write("GROK_LAUNCH_API_KEY=new-launcher-key\n")
+                    f.write("GROK_LAUNCH_MODEL=new-launcher-model\n")
+                    f.write("UNRELATED_SETTING=dotenv-value\n")
+
+                main.load_dotenv_files()
+
+                self.assertEqual(os.environ["GROK_LAUNCH_API_KEY"], "new-launcher-key")
+                self.assertEqual(os.environ["GROK_LAUNCH_MODEL"], "new-launcher-model")
+                self.assertEqual(os.environ["UNRELATED_SETTING"], "shell-value")
+        finally:
+            main._HERE = old_here
+            os.chdir(old_cwd)
+            os.environ.clear()
+            os.environ.update(old_env)
+
+    def test_load_dotenv_files_launcher_env_wins_over_cwd_env(self) -> None:
+        old_here = main._HERE
+        old_env = os.environ.copy()
+        old_cwd = os.getcwd()
+        try:
+            with tempfile.TemporaryDirectory() as cwd, tempfile.TemporaryDirectory() as repo_dir:
+                main._HERE = repo_dir
+                os.chdir(cwd)
+                os.environ.clear()
+                with open(os.path.join(repo_dir, ".env"), "w", encoding="utf-8") as f:
+                    f.write("GROK_LAUNCH_API_KEY=launcher-key\n")
+                with open(os.path.join(cwd, ".env"), "w", encoding="utf-8") as f:
+                    f.write("GROK_LAUNCH_API_KEY=cwd-key\n")
+
+                main.load_dotenv_files()
+
+                self.assertEqual(os.environ["GROK_LAUNCH_API_KEY"], "launcher-key")
+        finally:
+            main._HERE = old_here
+            os.chdir(old_cwd)
+            os.environ.clear()
+            os.environ.update(old_env)
 
 
 if __name__ == "__main__":

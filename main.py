@@ -32,6 +32,8 @@ _REQUIRED_KEYS = (
     "GROK_LAUNCH_BASE_URL",
     "GROK_LAUNCH_MODEL",
 )
+_MANAGED_ENV_PREFIXES = ("GROK_LAUNCH_",)
+_MANAGED_ENV_KEYS = {"GROK_BIN"}
 
 TARGET_BASE_URL: str = ""
 TARGET_MODEL: str = ""
@@ -226,6 +228,8 @@ def _candidate_env_paths() -> list[str]:
     if explicit:
         paths.append(os.path.expanduser(explicit))
 
+    paths.append(os.path.join(_HERE, ".env"))
+
     cwd = os.getcwd()
     paths.append(os.path.join(cwd, ".env"))
     paths.append(os.path.join(cwd, ".grok-launch.env"))
@@ -237,8 +241,6 @@ def _candidate_env_paths() -> list[str]:
         paths.append(os.path.join(parent, ".env"))
         paths.append(os.path.join(parent, ".grok-launch.env"))
         parent = os.path.dirname(parent)
-
-    paths.append(os.path.join(_HERE, ".env"))
 
     xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
     paths.append(os.path.join(xdg, "grok-launch", ".env"))
@@ -254,9 +256,13 @@ def _candidate_env_paths() -> list[str]:
     return uniq
 
 
+def _is_managed_env_key(key: str) -> bool:
+    return key in _MANAGED_ENV_KEYS or key.startswith(_MANAGED_ENV_PREFIXES)
+
+
 def load_dotenv_files() -> list[str]:
     loaded: list[str] = []
-    claimed = set(os.environ.keys())
+    claimed = {key for key in os.environ.keys() if not _is_managed_env_key(key)}
 
     for path in _candidate_env_paths():
         if not os.path.isfile(path):
